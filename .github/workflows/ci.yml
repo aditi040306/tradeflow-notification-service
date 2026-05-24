@@ -1,117 +1,212 @@
 # ============================================================
-# TradeFlow CI Pipeline
-# This file tells GitHub Actions WHAT to do and WHEN to do it
-# Location: .github/workflows/ci.yml
+# TradeFlow CI/CD Pipeline
+# ============================================================
+# This is the MASTER pipeline file. It does 3 things automatically
+# every time you push code to GitHub:
+#
+# JOB 1 → Build your Java code + run tests (CI)
+# JOB 2 → Build Docker image + push to AWS ECR (CI)
+# JOB 3 → SSH into EC2 + pull new image + restart app (CD)
+#
+# The result: you push code → your live AWS app updates automatically
+# No manual steps. No SSH. No docker run. All automated.
 # ============================================================
 
-name: TradeFlow CI Pipeline  # Name shown in GitHub Actions tab
+name: TradeFlow CI/CD Pipeline
 
 # ============================================================
-# TRIGGER — When should this pipeline run?
+# TRIGGER — When does this pipeline run?
 # ============================================================
 on:
   push:
-    branches: [ main, develop ]   # Run when code is pushed to main or develop
+    branches: [ main, develop ]   # Run on every push to main or develop
   pull_request:
-    branches: [ main ]            # Run when a PR is opened targeting main
-    # PR cannot merge if this pipeline fails
+    branches: [ main ]            # Run on every PR targeting main
+    # PR is BLOCKED from merging if pipeline fails
 
-# ============================================================
-# JOBS — The actual work. Each job runs on a separate VM.
-# Jobs run in PARALLEL by default unless you use "needs"
-# ============================================================
 jobs:
 
-  # ----------------------------------------------------------
-  # JOB 1: Build the app and run tests
-  # ----------------------------------------------------------
+  # ============================================================
+  # JOB 1: BUILD AND TEST
+  # ============================================================
+  # What it does: Compiles Java code, runs JUnit tests
+  # If tests fail → pipeline stops here, nothing deploys
+  # This is your QUALITY GATE — bad code never reaches AWS
+  # ============================================================
   build-and-test:
-    name: Build & Test                  # Label shown in GitHub UI
-    runs-on: ubuntu-latest              # GitHub spins up a fresh Linux VM
-
-    steps:                              # Steps run sequentially inside this job
-
-      # Step 1: Pull your code into the VM
-      - name: Checkout code
-        uses: actions/checkout@v4       # "uses" means: use a pre-built GitHub Action
-        # checkout@v4 = official action to clone your repo
-
-      # Step 2: Install Java 21 on the VM
-      - name: Set up Java 21
-        uses: actions/setup-java@v4     # Official action to install Java
-        with:
-          java-version: '21'            # Install Java 21 specifically
-          distribution: 'temurin'       # Use Eclipse Temurin build (industry standard)
-          cache: maven                  # Cache Maven dependencies = faster future builds
-
-      # Step 3: Compile the code and create the JAR file
-      - name: Build with Maven
-        run: ./mvnw clean package -DskipTests -B
-        # clean        = delete any previous build files
-        # package      = compile + create JAR
-        # -DskipTests  = skip tests here, we run them separately next
-        # -B           = batch mode, cleaner logs in CI
-
-      # Step 4: Run all JUnit tests
-      - name: Run Tests
-        run: ./mvnw test -B
-        # If ANY test fails, this step fails
-        # Pipeline stops here, PR is blocked from merging
-        # This is your quality gate
-
-      # Step 5: Save test reports as downloadable artifact
-      - name: Upload test results
-        if: always()                    # Run this step even if tests failed
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results            # Name of the artifact in GitHub UI
-          path: target/surefire-reports/ # Maven puts test reports here
-
-  # ----------------------------------------------------------
-  # JOB 2: Build the Docker image
-  # Only runs if Job 1 (build-and-test) passes
-  # ----------------------------------------------------------
-  docker-build:
-    name: Docker Build
-    runs-on: ubuntu-latest              # Another fresh Linux VM (parallel to Job 1 by default)
-    needs: build-and-test               # BUT "needs" makes it wait for Job 1 to pass first
-    # If tests fail in Job 1, this job never runs
+    name: Build & Test
+    runs-on: ubuntu-latest        # GitHub spins up a fresh Linux VM
 
     steps:
 
-      # Step 1: Pull code again (each job gets a fresh VM)
+      # Pull your code into the VM
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Step 2: Build the Docker image
-      - name: Build Docker image
-        run: docker build -t tradeflow-notification:${{ github.sha }} .
-        # docker build          = build image from our Dockerfile
-        # -t                    = tag the image with a name
-        # ${{ github.sha }}     = the unique commit hash (e.g. a1b2c3d)
-        #                         every build gets a unique tag = full traceability
-        #                         you know exactly which code version is in any image
-        # .                     = use Dockerfile in current directory
+      # Install Java 21 on the VM
+      # cache: maven → saves dependencies so next run is faster
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
 
-      # Step 3: Confirm the image was actually created
-      - name: Verify Docker image
-        run: docker images tradeflow-notification
-        # Lists the image we just built
-        # Catches edge cases where build "succeeded" but image wasn't created
+      # Compile the code and create the JAR
+      # -DskipTests → skip tests here, we run them in the next step
+      # -B → batch mode, cleaner logs in CI
+      - name: Build with Maven
+        run: ./mvnw clean package -DskipTests -B
+
+      # Run all 4 JUnit tests
+      # If ANY test fails → this step fails → pipeline stops
+      # Nothing gets deployed to AWS
+      - name: Run Tests
+        run: ./mvnw test -B
+
+      # Save test reports so you can download and inspect them
+      # if: always() → save reports even if tests failed
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: target/surefire-reports/
+
+  # ============================================================
+  # JOB 2: DOCKER BUILD AND PUSH TO ECR
+  # ============================================================
+  # What it does: Builds Docker image and pushes it to AWS ECR
+  # needs: build-and-test → ONLY runs if Job 1 passed
+  # if: github.ref == 'refs/heads/main' → ONLY runs on main branch
+  #     (not on PRs — we don't push images for every PR)
+  # ============================================================
+  docker-build-and-push:
+    name: Docker Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: build-and-test                           # Wait for Job 1 to pass first
+    if: github.ref == 'refs/heads/main'             # Only run on main branch pushes
+
+    steps:
+
+      # Pull code again — each job gets a FRESH VM with nothing on it
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Authenticate GitHub Actions to AWS using our IAM credentials
+      # secrets.AWS_ACCESS_KEY_ID → stored securely in GitHub Secrets
+      # secrets.AWS_SECRET_ACCESS_KEY → stored securely in GitHub Secrets
+      # Never hardcode AWS keys in code — always use secrets
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # Login to ECR — same as running:
+      # aws ecr get-login-password | docker login ...
+      # but done automatically using the AWS credentials above
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build the Docker image and push it to ECR
+      # --platform linux/amd64 → build for EC2 (Intel) not Mac (ARM)
+      # IMAGE_TAG: github.sha → tag with commit hash for full traceability
+      #   e.g. tradeflow-notification:a1b2c3d
+      #   you always know exactly which code version is running in prod
+      # Two tags: commit SHA (specific) + latest (for easy pulling)
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: 427267592919.dkr.ecr.us-east-1.amazonaws.com
+          ECR_REPOSITORY: tradeflow-notification
+          IMAGE_TAG: ${{ github.sha }}             # Unique tag per commit
+        run: |
+          docker buildx create --use
+          docker buildx build \
+            --platform linux/amd64 \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            --push .
+
+  # ============================================================
+  # JOB 3: DEPLOY TO EC2
+  # ============================================================
+  # What it does: SSHs into your EC2 server and deploys the new image
+  # needs: docker-build-and-push → ONLY runs if Job 2 passed
+  # if: github.ref == 'refs/heads/main' → ONLY runs on main branch
+  #
+  # Deployment strategy: stop old container → start new one
+  # --restart unless-stopped → container auto-restarts if EC2 reboots
+  # ============================================================
+  deploy-to-ec2:
+    name: Deploy to AWS EC2
+    runs-on: ubuntu-latest
+    needs: docker-build-and-push                    # Wait for Job 2 to pass first
+    if: github.ref == 'refs/heads/main'             # Only deploy from main branch
+
+    steps:
+
+      # SSH into EC2 and run deployment commands
+      # host → your EC2 public IP (stored in GitHub Secrets)
+      # username → ec2-user (default user for Amazon Linux)
+      # key → your private SSH key (stored in GitHub Secrets)
+      # script → commands that run ON the EC2 server
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}             # 3.91.198.41
+          username: ec2-user                        # Default Amazon Linux user
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}   # Private key from GitHub Secrets
+          script: |
+            # Step 1: Login to ECR from inside EC2
+            # EC2 needs permission to pull your private Docker image
+            aws ecr get-login-password --region us-east-1 | \
+              docker login --username AWS \
+              --password-stdin 427267592919.dkr.ecr.us-east-1.amazonaws.com
+
+            # Step 2: Pull the latest image from ECR
+            docker pull 427267592919.dkr.ecr.us-east-1.amazonaws.com/tradeflow-notification:latest
+
+            # Step 3: Stop the currently running container
+            # || true → don't fail if container doesn't exist yet (first deploy)
+            docker stop tradeflow || true
+            docker rm tradeflow || true
+
+            # Step 4: Start the new container with updated image
+            # -d → run in background (detached mode)
+            # -p 8080:8080 → map EC2 port 8080 to container port 8080
+            # --restart unless-stopped → auto restart if server reboots
+            docker run -d \
+              -p 8080:8080 \
+              --name tradeflow \
+              --restart unless-stopped \
+              427267592919.dkr.ecr.us-east-1.amazonaws.com/tradeflow-notification:latest
+
+            echo "Deployment complete — TradeFlow is live on AWS"
 
 # ============================================================
-# WHAT HAPPENS WHEN YOU RUN: git push
+# COMPLETE FLOW SUMMARY
 # ============================================================
-# 1. GitHub detects the push
-# 2. Reads this file from .github/workflows/ci.yml
-# 3. Spins up a Linux VM for Job 1
-# 4. Job 1: installs Java, builds JAR, runs 4 JUnit tests
-#    - If tests FAIL → pipeline stops, PR blocked, you get an email
-#    - If tests PASS → Job 2 starts
-# 5. Job 2: spins up another VM, builds Docker image, verifies it
-# 6. Green checkmark on your GitHub commit
+# You run: git push origin main
 #
-# TOMORROW (Day 2) we add:
-# Job 3: Push Docker image to AWS ECR
-# Job 4: SSH into EC2 and deploy the new image
+# GitHub reads this file and:
+#
+# 1. Spins up VM1 → builds JAR → runs 4 tests
+#    FAIL? → stops here. Nothing deploys. You get an email.
+#    PASS? → moves to Job 2
+#
+# 2. Spins up VM2 → builds Docker image for linux/amd64
+#    → pushes to ECR tagged with commit SHA + latest
+#    FAIL? → stops here. Nothing deploys.
+#    PASS? → moves to Job 3
+#
+# 3. Spins up VM3 → SSHs into your EC2 at 3.91.198.41
+#    → pulls new image from ECR
+#    → stops old container
+#    → starts new container
+#    → app is updated. Zero manual work.
+#
+# Total time: ~3-4 minutes from git push to live on AWS
 # ============================================================

@@ -1,0 +1,458 @@
+Step 1 — Create IAM User
+
+In the AWS search bar at the top type IAM and click it
+In the left sidebar click Users
+Click Create user (top right)
+Username: tradeflow-cicd
+Click Next
+Select Attach policies directly
+Search and check these 3 policies:
+
+AmazonEC2FullAccess
+AmazonEC2ContainerRegistryFullAccess
+AmazonVPCFullAccess
+
+
+Click Next → Create user
+
+Step 2 — Create Access Keys for this user
+
+Click on the user tradeflow-cicd you just created
+Click Security credentials tab
+Scroll down to Access keys → click Create access key
+Select Command Line Interface (CLI)
+Check the confirmation box → click Next → Create access key
+You'll see Access key ID and Secret access key
+Download the CSV file — you only see the secret key once
+
+# Commands
+aws configure
+AWS Access Key ID: <paste your access key ID from CSV>
+AWS Secret Access Key: <paste your secret access key from CSV>
+Default region name: us-east-1
+Default output format: json
+aws sts get-caller-identity
+
+-- output
+
+aditiverma@Mac ~ % aws sts get-caller-identity
+{
+    "UserId": "AIDAWG6ZCCLL5ZW747JIV",
+    "Account": "427267592919",
+    "Arn": "arn:aws:iam::427267592919:user/tradeflow-cicd"
+}
+aditiverma@Mac ~ %
+
+
+Step 3 — Create ECR Repository
+ECR is AWS's Docker image registry — like Docker Hub but private and inside AWS. This is where GitHub Actions will push your Docker image.
+
+
+aditiverma@Mac ~ % aws ecr create-repository \
+  --repository-name tradeflow-notification \
+  --region us-east-1
+{
+    "repository": {
+        "repositoryArn": "arn:aws:ecr:us-east-1:427267592919:repository/tradeflow-notification",
+        "registryId": "427267592919",
+        "repositoryName": "tradeflow-notification",
+        "repositoryUri": "427267592919.dkr.ecr.us-east-1.amazonaws.com/tradeflow-notification",
+        "createdAt": "2026-05-24T15:32:05.992000-05:00",
+        "imageTagMutability": "MUTABLE",
+        "imageScanningConfiguration": {
+            "scanOnPush": false
+        },
+        "encryptionConfiguration": {
+            "encryptionType": "AES256"
+        }
+    }
+}
+aditiverma@Mac ~ %
+Below URL we will now use everywhere :
+
+427267592919.dkr.ecr.us-east-1.amazonaws.com/tradeflow-notification
+
+ECR repository created. Save this URI — you'll use it everywhere:
+
+```
+427267592919.dkr.ecr.us-east-1.amazonaws.com/tradeflow-notification
+```
+
+**Step 4 — Push Docker image to ECR manually first**
+
+We do this manually once so you understand the flow. GitHub Actions will automate this exact process tomorrow.
+
+Run these 4 commands one by one:
+
+# Below command we just need to type as username is AWS for every ECR account and passowrd it automatically detects
+**Command 1 — Login to ECR:**
+```bash
+aws ecr get-login-password --region us-east-1 | \
+  docker login --username AWS \
+  --password-stdin 427267592919.dkr.ecr.us-east-1.amazonaws.com
+```
+
+**Command 2 — Tag your existing image with ECR URI:**
+```bash
+docker tag tradeflow-notification:latest \
+  427267592919.dkr.ecr.us-east-1.amazonaws.com/tradeflow-notification:latest
+```
+
+**Command 3 — Push to ECR:**
+```bash
+docker push \
+  427267592919.dkr.ecr.us-east-1.amazonaws.com/tradeflow-notification:latest
+```
+
+**Command 4 — Verify it's there:**
+```bash
+aws ecr list-images \
+  --repository-name tradeflow-notification \
+  --region us-east-1
+```
+
+Run them one by one and paste the output. You should see your image listed in ECR at the end.
+
+
+
+Your Docker image is now on AWS. Let's verify:
+aws ecr list-images \
+  --repository-name tradeflow-notification \
+  --region us-east-1
+
+
+--------------------------------------------------------------------------------------------------------------'
+
+Now Terraform — this is the IaC part of the JD.
+What is Terraform in plain English?
+Instead of clicking around in AWS console to create servers, you write code that describes what infrastructure you want.
+Terraform reads that code and creates it. This is what "Infrastructure as Code" means.
+At PIMCO they use this so every environment (dev, staging, prod) is identical and reproducible.
+First — install Terraform:
+brew install hashicorp/tap/terraform
+terraform --version
+mkdir -p "/Users/aditiverma/Documents/Aditi Study/Projects/tradeflow/notification-service/terraform"
+cd "/Users/aditiverma/Documents/Aditi Study/Projects/tradeflow/notification-service/terraform"
+
+
+
+-------
+
+Great habit — understand before you execute. Let me break down all 3 files.
+
+---
+
+**The big picture first**
+
+Think of Terraform like ordering from a restaurant. `variables.tf` is the menu (what options exist), `main.tf` is your order (what you actually want), and `outputs.tf` is the receipt (what you get back after your order is fulfilled).
+
+---
+
+**File 1 — `variables.tf` (the menu)**
+
+This file just defines configurable values so you never hardcode things in `main.tf`. For example instead of writing `us-east-1` everywhere, you define it once here. If you ever want to deploy to a different region, you change it in one place. This is exactly how PIMCO would manage dev vs staging vs prod — same `main.tf`, different variable values.
+
+---
+
+**File 2 — `main.tf` (your order — the most important file)**
+
+This is where you actually define the 3 AWS resources Terraform will create:
+
+**Resource 1 — Key Pair.** This is how you SSH into your EC2 server. You give AWS your public SSH key, AWS stores it, and when EC2 starts it puts that key on the server. Only someone with the matching private key (you) can log in. This is how every engineer connects to a production server securely — no passwords.
+
+**Resource 2 — Security Group.** This is the firewall around your EC2 instance. It controls what traffic is allowed in and out. We open port 22 for SSH (so you can connect) and port 8080 for your app (so the world can call your API). Everything else is blocked. At Citi this is what kept their payment servers secure.
+
+**Resource 3 — EC2 Instance.** This is the actual Linux server in AWS. `t2.micro` is free tier — costs you nothing. Inside it there's a `user_data` script — this is a bash script that runs automatically the very first time EC2 boots up. It installs Docker on the server so it's ready to run your container the moment GitHub Actions deploys to it.
+
+---
+
+**File 3 — `outputs.tf` (the receipt)**
+
+After Terraform creates everything, you need to know the IP address of your server to connect to it and to give GitHub Actions. `outputs.tf` tells Terraform to print those values when it finishes. Without this you'd have to go dig through the AWS console to find them.
+
+---
+
+**How all 3 work together — the exact sequence:**
+
+```
+You run: terraform apply
+    ↓
+Terraform reads variables.tf  →  gets region, ami, key path
+    ↓
+Terraform reads main.tf       →  creates key pair, security group, EC2
+    ↓
+EC2 boots → user_data runs → Docker gets installed automatically
+    ↓
+Terraform reads outputs.tf    →  prints your EC2 IP and DNS
+    ↓
+You take that IP → give it to GitHub Actions → pipeline deploys your app
+```
+
+---
+
+Now let's generate your SSH key since it doesn't exist. Run:
+
+```bash
+ssh-keygen -t rsa -b 4096 -C "tradeflow-cicd" -f ~/.ssh/id_rsa -N ""
+```
+
+Then verify:
+
+```bash
+ls ~/.ssh/
+```
+
+Paste the output.
+aditiverma@Mac terraform % ls ~/.ssh/
+id_ed25519	id_rsa		known_hosts
+id_ed25519.pub	id_rsa.pub	known_hosts.old
+
+
+GitHub Actions uses IAM keys        →  to talk to AWS APIs
+                                       (create EC2, push to ECR)
+
+GitHub Actions uses SSH key         →  to get inside the EC2 server
+                                       (run docker pull, docker run)
+
+
+Real world analogy:
+Think of AWS as a bank building.
+
+IAM keys = your ID card that gets you past the security guard at the front door
+SSH key = the physical key to your specific office inside the building
+
+You need both. One to authenticate to AWS, one to actually get into the server.
+
+
+-------------
+
+cd "/Users/aditiverma/Documents/Aditi Study/Projects/tradeflow/notification-service/terraform"
+terraform init
+
+output :
+Terraform has been successfully initialized!
+
+command:
+terraform plan
+
+What this does: Terraform reads your main.tf and shows you exactly what it WILL create — without actually
+creating anything yet. It's a dry run. At PIMCO this is how engineers review infrastructure changes before
+applying them — like a PR review but for cloud resources.
+
+----
+output :
+
+Terraform used the selected providers to generate the following execution plan.
+Resource actions are indicated with the following symbols:
+  + create
+
+Terraform will perform the following actions:
+
+  # aws_instance.tradeflow_ec2 will be created
+  + resource "aws_instance" "tradeflow_ec2" {
+      + ami                                  = "ami-0c02fb55956c7d316"
+      + arn                                  = (known after apply)
+      + associate_public_ip_address          = (known after apply)
+      + availability_zone                    = (known after apply)
+      + disable_api_stop                     = (known after apply)
+      + disable_api_termination              = (known after apply)
+      + ebs_optimized                        = (known after apply)
+      + enable_primary_ipv6                  = (known after apply)
+      + force_destroy                        = false
+      + get_password_data                    = false
+      + host_id                              = (known after apply)
+      + host_resource_group_arn              = (known after apply)
+      + iam_instance_profile                 = (known after apply)
+      + id                                   = (known after apply)
+      + instance_initiated_shutdown_behavior = (known after apply)
+      + instance_lifecycle                   = (known after apply)
+      + instance_state                       = (known after apply)
+      + instance_type                        = "t2.micro"
+      + ipv6_address_count                   = (known after apply)
+      + ipv6_addresses                       = (known after apply)
+      + key_name                             = "tradeflow-key"
+      + monitoring                           = (known after apply)
+      + outpost_arn                          = (known after apply)
+      + password_data                        = (known after apply)
+      + placement_group                      = (known after apply)
+      + placement_group_id                   = (known after apply)
+      + placement_partition_number           = (known after apply)
+      + primary_network_interface_id         = (known after apply)
+      + private_dns                          = (known after apply)
+      + private_ip                           = (known after apply)
+      + public_dns                           = (known after apply)
+      + public_ip                            = (known after apply)
+      + region                               = "us-east-1"
+      + secondary_private_ips                = (known after apply)
+      + security_groups                      = (known after apply)
+      + source_dest_check                    = true
+      + spot_instance_request_id             = (known after apply)
+      + subnet_id                            = (known after apply)
+      + tags                                 = {
+          + "Env"     = "prod"
+          + "Name"    = "tradeflow-notification-server"
+          + "Project" = "TradeFlow"
+        }
+      + tags_all                             = {
+          + "Env"     = "prod"
+          + "Name"    = "tradeflow-notification-server"
+          + "Project" = "TradeFlow"
+        }
+      + tenancy                              = (known after apply)
+      + user_data                            = <<-EOT
+            #!/bin/bash
+            yum update -y
+            yum install -y docker
+            systemctl start docker
+            systemctl enable docker
+            usermod -aG docker ec2-user
+        EOT
+      + user_data_base64                     = (known after apply)
+      + user_data_replace_on_change          = false
+      + vpc_security_group_ids               = (known after apply)
+
+      + capacity_reservation_specification (known after apply)
+
+      + cpu_options (known after apply)
+
+      + ebs_block_device (known after apply)
+
+      + enclave_options (known after apply)
+
+      + ephemeral_block_device (known after apply)
+
+      + instance_market_options (known after apply)
+
+      + maintenance_options (known after apply)
+
+      + metadata_options (known after apply)
+
+      + network_interface (known after apply)
+
+      + primary_network_interface (known after apply)
+
+      + private_dns_name_options (known after apply)
+
+      + root_block_device (known after apply)
+
+      + secondary_network_interface (known after apply)
+    }
+
+  # aws_key_pair.tradeflow_key will be created
+  + resource "aws_key_pair" "tradeflow_key" {
+      + arn             = (known after apply)
+      + fingerprint     = (known after apply)
+      + id              = (known after apply)
+      + key_name        = "tradeflow-key"
+      + key_name_prefix = (known after apply)
+      + key_pair_id     = (known after apply)
+      + key_type        = (known after apply)
+      + public_key      = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDEMyab3B26g6nPF1sgqHWsM2cDJbtVz37mrWL0Eey5MHYagyMkIA8scWhQuSK98z9meIDV0SSgOZ2U4+SFpotzRNWR3UZjNNcqUa4boD495ZGcpVqt32OGqCE+NygaW56eP5WkRthaqmtx8/zX4NC8TQyEq+2lRkt591z9MijVnxzmGgC4nSybCPkaGyp3eagPZKjP5+myfFGaE+/2/IiGEpo8t8Z+CC8mWSAqHsZqtzHx8TvIiX5MAHSDfulxs1eWLIOXq3dezMP7i6+kYAZYPMf2in2KlBMwHCi0hA1iL08q5VEEm71U9Tq2QlxWO9+PhQINtniaB/7WVEuX67RnG2Rkb2ZzDcOTXaHzw0ld9aXxl+5woIyjpGWuoP/g9m9BiSQeCdTFE4VaBlxy92HGr3qkszzoJw49KSUA76M3lF6wqqROYL6Yt3DpN7fRhqK6DGNhFDbSU93+yYnVC5kid1+m7oT0UgfuZfSryJne8awelz14Izd4p2zTczEp9/hPN7q8uUfBmXJhkh6XSDz9gKJS/zH3sYavYk+rkxZBepny8CxJR5NaXT2mJzvGTEkjGiCuIFrtk0Vvi1evXgIm24pcLxQ7QWIJV8Ea6pDopBqYKojVKZO0lGqwC7fG7lK86YJudjRy5fRR/AEwM2dXyTgv60bMJxsbsmfKO9FihQ== tradeflow-cicd"
+      + region          = "us-east-1"
+      + tags_all        = (known after apply)
+    }
+
+  # aws_security_group.tradeflow_sg will be created
+  + resource "aws_security_group" "tradeflow_sg" {
+      + arn                    = (known after apply)
+      + description            = "Allow SSH and app traffic"
+      + egress                 = [
+          + {
+              + cidr_blocks      = [
+                  + "0.0.0.0/0",
+                ]
+              + from_port        = 0
+              + ipv6_cidr_blocks = []
+              + prefix_list_ids  = []
+              + protocol         = "-1"
+              + security_groups  = []
+              + self             = false
+              + to_port          = 0
+                # (1 unchanged attribute hidden)
+            },
+        ]
+      + id                     = (known after apply)
+      + ingress                = [
+          + {
+              + cidr_blocks      = [
+                  + "0.0.0.0/0",
+                ]
+              + from_port        = 22
+              + ipv6_cidr_blocks = []
+              + prefix_list_ids  = []
+              + protocol         = "tcp"
+              + security_groups  = []
+              + self             = false
+              + to_port          = 22
+                # (1 unchanged attribute hidden)
+            },
+          + {
+              + cidr_blocks      = [
+                  + "0.0.0.0/0",
+                ]
+              + from_port        = 8080
+              + ipv6_cidr_blocks = []
+              + prefix_list_ids  = []
+              + protocol         = "tcp"
+              + security_groups  = []
+              + self             = false
+              + to_port          = 8080
+                # (1 unchanged attribute hidden)
+            },
+        ]
+      + name                   = "tradeflow-sg"
+      + name_prefix            = (known after apply)
+      + owner_id               = (known after apply)
+      + region                 = "us-east-1"
+      + revoke_rules_on_delete = false
+      + tags_all               = (known after apply)
+      + vpc_id                 = (known after apply)
+    }
+
+Plan: 3 to add, 0 to change, 0 to destroy.
+
+Changes to Outputs:
+  + ec2_public_dns    = (known after apply)
+  + ec2_public_ip     = (known after apply)
+  + ecr_login_command = "aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 427267592919.dkr.ecr.us-east-1.amazonaws.com"
+
+───────────────────────────────────────────────────────────────────────────────
+
+Note: You didn't use the -out option to save this plan, so Terraform can't
+guarantee to take exactly these actions if you run "terraform apply" now.
+aditiverma@Mac terraform %
+
+
+
+--------------
+
+Perfect plan output. Let me quickly explain what you're seeing before we apply:
+
+**`Plan: 3 to add, 0 to change, 0 to destroy`** — Terraform will create exactly 3 resources:
+- 1 Key Pair
+- 1 Security Group
+- 1 EC2 instance (t2.micro, free tier)
+
+**`(known after apply)`** — means AWS will assign these values after creation. For example the public IP doesn't exist yet — AWS assigns it when EC2 starts.
+
+This is exactly what a senior engineer reviews before running `terraform apply` in production. You'd share this plan output with your team for approval first.
+
+---
+
+Now create the infrastructure:
+
+```bash
+terraform apply
+```
+
+It will show the same plan and ask:
+```
+Do you want to perform these actions? yes/no
+```
+
+Type `yes` and hit Enter.
+
+Takes about 30-60 seconds. Paste the output — specifically the bottom part where it shows your EC2 public IP.
+
+
+
