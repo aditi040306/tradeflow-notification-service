@@ -114,7 +114,7 @@ jobs:
       # Build the Docker image and push it to ECR
       # --platform linux/amd64 → build for EC2 (Intel) not Mac (ARM)
       # IMAGE_TAG: github.sha → tag with commit hash for full traceability
-      #   e.g. tradeflow-notification:a1b2c34d
+      #   e.g. tradeflow-notification:a1b2c345d
       #   you always know exactly which code version is running in prod
       # Two tags: commit SHA (specific) + latest (for easy pulling)
       - name: Build and push Docker image
