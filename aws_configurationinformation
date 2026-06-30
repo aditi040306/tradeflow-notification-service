@@ -426,7 +426,7 @@ aditiverma@Mac terraform %
 
 --------------
 
-Perfect plan output. Let me quickly explain what you're seeing before we apply:
+
 
 **`Plan: 3 to add, 0 to change, 0 to destroy`** — Terraform will create exactly 3 resources:
 - 1 Key Pair
@@ -435,7 +435,7 @@ Perfect plan output. Let me quickly explain what you're seeing before we apply:
 
 **`(known after apply)`** — means AWS will assign these values after creation. For example the public IP doesn't exist yet — AWS assigns it when EC2 starts.
 
-This is exactly what a senior engineer reviews before running `terraform apply` in production. You'd share this plan output with your team for approval first.
+This is exactly  should be reviews before running `terraform apply` in production. You'd share this plan output with your team for approval first.
 
 ---
 
